@@ -10,10 +10,147 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 import imageio_ffmpeg
+import tifffile as tiff
 
 
 # =========================
-# HSV AUTO-CALIBRATION
+# Helpers
+# =========================
+def make_zip(files: list[tuple[str, bytes]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files:
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+def convert_avi_to_mp4(avi_path: str, mp4_path: str) -> None:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i", avi_path,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        mp4_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def read_image_any(uploaded_file) -> np.ndarray:
+    """PNG/JPG/TIF okur. TIF çok-kanallı olabilir."""
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getbuffer()
+    if name.endswith((".tif", ".tiff")):
+        arr = tiff.imread(io.BytesIO(data))
+        return arr
+    file_bytes = np.asarray(bytearray(data), dtype=np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
+    return img
+
+
+def to_uint8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+# =========================
+# IMAGE MODE: segment from RED, measure GREEN
+# =========================
+def segment_cells_from_red(red_gray: np.ndarray, min_area: int = 50, peak_thresh: float = 0.35) -> np.ndarray:
+    """
+    Red kanaldan hücreleri ayırmak için:
+    - Otsu threshold
+    - Distance transform + peaks
+    - Watershed
+    Dönen: labels (0 background, 1..N hücre)
+    """
+    r = to_uint8(red_gray)
+    blur = cv2.GaussianBlur(r, (0, 0), 1.2)
+    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k, iterations=1)
+
+    dist = cv2.distanceTransform(bw, cv2.DIST_L2, 5)
+    dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
+
+    _, peaks = cv2.threshold(dist_norm, float(peak_thresh), 1.0, cv2.THRESH_BINARY)
+    peaks = (peaks * 255).astype(np.uint8)
+
+    num, markers = cv2.connectedComponents(peaks)
+    markers = markers + 1
+    markers[bw == 0] = 0
+
+    color = cv2.cvtColor(r, cv2.COLOR_GRAY2BGR)
+    ws = cv2.watershed(color, markers)
+
+    labels = ws.copy()
+    labels[labels < 2] = 0
+    labels = labels - 1  # hücreler 1..N
+
+    # min_area filtresi + yeniden numaralandır
+    out = np.zeros_like(labels, dtype=np.int32)
+    new_id = 1
+    for cid in np.unique(labels):
+        if cid == 0:
+            continue
+        mask = (labels == cid)
+        area = int(mask.sum())
+        if area < int(min_area):
+            continue
+        out[mask] = new_id
+        new_id += 1
+
+    return out
+
+
+def measure_green_intensity(cell_labels: np.ndarray, green_gray: np.ndarray) -> pd.DataFrame:
+    g = green_gray
+    rows = []
+    max_id = int(cell_labels.max())
+    for cid in range(1, max_id + 1):
+        mask = (cell_labels == cid)
+        if not mask.any():
+            continue
+        vals = g[mask].astype(np.float32)
+        rows.append({
+            "cell_id": cid,
+            "area_px": int(mask.sum()),
+            "green_mean": float(vals.mean()),
+            "green_median": float(np.median(vals)),
+            "green_sum": float(vals.sum()),
+            "green_max": float(vals.max()),
+        })
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return df
+    return df.sort_values("green_mean", ascending=False)
+
+
+def draw_cell_overlay(gray: np.ndarray, labels: np.ndarray, put_ids: bool = True) -> np.ndarray:
+    base = to_uint8(gray)
+    out = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+
+    mask = (labels > 0).astype(np.uint8) * 255
+    edges = cv2.Canny(mask, 50, 150)
+    out[edges > 0] = (0, 255, 255)
+
+    if put_ids:
+        for cid in range(1, int(labels.max()) + 1):
+            ys, xs = np.where(labels == cid)
+            if len(xs) == 0:
+                continue
+            cx, cy = int(xs.mean()), int(ys.mean())
+            cv2.putText(out, str(cid), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+    return out
+
+
+# =========================
+# VIDEO MODE: (existing pipeline)
 # =========================
 def auto_calibrate_hsv(video_path: str, sample_frames: int = 8,
                        s_min: int = 30, v_min: int = 30,
@@ -30,13 +167,11 @@ def auto_calibrate_hsv(video_path: str, sample_frames: int = 8,
     target_set = set(int(i) for i in idxs)
 
     hs, ss, vs = [], [], []
-
     cur = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
         if cur in target_set:
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             H = hsv[:, :, 0]
@@ -51,9 +186,7 @@ def auto_calibrate_hsv(video_path: str, sample_frames: int = 8,
                 hs.append(H[mask].astype(np.int16))
                 ss.append(S[mask].astype(np.int16))
                 vs.append(V[mask].astype(np.int16))
-
         cur += 1
-
     cap.release()
 
     if len(hs) == 0:
@@ -74,37 +207,6 @@ def auto_calibrate_hsv(video_path: str, sample_frames: int = 8,
     return [h_lo, s_lo, v_lo], [h_hi, 255, 255]
 
 
-# =========================
-# ZIP helper
-# =========================
-def make_zip(files: list[tuple[str, bytes]]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, data in files:
-            z.writestr(name, data)
-    return buf.getvalue()
-
-
-# =========================
-# AVI -> MP4 conversion (H.264)
-# =========================
-def convert_avi_to_mp4(avi_path: str, mp4_path: str) -> None:
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i", avi_path,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p",
-        mp4_path,
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-
-# =========================
-# PIPELINE (GUI'siz) + PROGRESS
-# =========================
 def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +215,6 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
     output_cell_csv = out_dir / "tracks_with_protein.csv"
     output_spot_csv = out_dir / "spot_tracks.csv"
 
-    # --- params ---
     BLUR_SIGMA = params["BLUR_SIGMA"]
     CLAHE_CLIP = params["CLAHE_CLIP"]
     CLAHE_TILE = tuple(params["CLAHE_TILE"])
@@ -137,9 +238,6 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
     SPOT_MAX_DIST = params["SPOT_MAX_DIST"]
     SPOT_AREA_WEIGHT = params["SPOT_AREA_WEIGHT"]
     SPOT_MAX_MISSED = params["SPOT_MAX_MISSED"]
-
-    DRAW_BBOX = True
-    DRAW_SPOTS = True
 
     def segment_nuclei(frame_bgr: np.ndarray):
         B = frame_bgr[:, :, 0].astype(np.uint8)
@@ -200,7 +298,7 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
             sx, sy = s["x"], s["y"]
             dx = nuc_xy[:, 0] - sx
             dy = nuc_xy[:, 1] - sy
-            dist2 = dx*dx + dy*dy
+            dist2 = dx * dx + dy * dy
             k = int(np.argmin(dist2))
             dist = float(np.sqrt(dist2[k]))
             cc_id = int(nuc_xy[k, 2]) if dist <= max_dist else 0
@@ -212,61 +310,38 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
 
         return spots, cell_spot_count, cell_spot_area
 
-    def hungarian_assign_cells(cell_tracks: dict, dets: list, max_dist: float):
-        track_ids = list(cell_tracks.keys())
-        if len(track_ids) == 0 or len(dets) == 0:
-            return [-1] * len(dets)
+    def hungarian_assign_tracks(tracks: dict, dets_xy_area: list, max_dist: float, area_weight: float):
+        track_ids = list(tracks.keys())
+        if len(track_ids) == 0 or len(dets_xy_area) == 0:
+            return [-1] * len(dets_xy_area)
 
-        cost = np.full((len(track_ids), len(dets)), 1e6, dtype=np.float32)
+        cost = np.full((len(track_ids), len(dets_xy_area)), 1e6, dtype=np.float32)
+
         for i, tid in enumerate(track_ids):
-            tx, ty = cell_tracks[tid]["cx"], cell_tracks[tid]["cy"]
-            ta = max(int(cell_tracks[tid]["area"]), 1)
-            for j, d in enumerate(dets):
-                dx = d["cx"] - tx
-                dy = d["cy"] - ty
-                dist = float((dx*dx + dy*dy) ** 0.5)
+            tx, ty = tracks[tid]["x"], tracks[tid]["y"]
+            ta = max(int(tracks[tid]["area"]), 1)
+            for j, d in enumerate(dets_xy_area):
+                dx = d["x"] - tx
+                dy = d["y"] - ty
+                dist = float((dx * dx + dy * dy) ** 0.5)
                 if dist <= max_dist:
                     area_ratio = abs(int(d["area"]) - ta) / ta
-                    cost[i, j] = dist + AREA_WEIGHT * area_ratio
+                    cost[i, j] = dist + area_weight * area_ratio
 
         row_ind, col_ind = linear_sum_assignment(cost)
-        assigned = [-1] * len(dets)
+        assigned = [-1] * len(dets_xy_area)
         for r, c in zip(row_ind, col_ind):
             if cost[r, c] < 1e5:
                 assigned[c] = track_ids[r]
         return assigned
 
-    def near_existing_track(cell_tracks: dict, d: dict, radius: float) -> bool:
-        for tr in cell_tracks.values():
-            dx = d["cx"] - tr["cx"]
-            dy = d["cy"] - tr["cy"]
-            if (dx*dx + dy*dy) ** 0.5 <= radius:
+    def near_existing(tracks: dict, x: float, y: float, radius: float) -> bool:
+        for tr in tracks.values():
+            dx = x - tr["x"]
+            dy = y - tr["y"]
+            if (dx * dx + dy * dy) ** 0.5 <= radius:
                 return True
         return False
-
-    def hungarian_assign_spots(spot_tracks: dict, spots: list):
-        track_ids = list(spot_tracks.keys())
-        if len(track_ids) == 0 or len(spots) == 0:
-            return [-1] * len(spots)
-
-        cost = np.full((len(track_ids), len(spots)), 1e6, dtype=np.float32)
-        for i, sid in enumerate(track_ids):
-            tx, ty = spot_tracks[sid]["x"], spot_tracks[sid]["y"]
-            ta = max(int(spot_tracks[sid]["area"]), 1)
-            for j, s in enumerate(spots):
-                dx = s["x"] - tx
-                dy = s["y"] - ty
-                dist = float((dx*dx + dy*dy) ** 0.5)
-                if dist <= SPOT_MAX_DIST:
-                    area_ratio = abs(int(s["area"]) - ta) / ta
-                    cost[i, j] = dist + SPOT_AREA_WEIGHT * area_ratio
-
-        row_ind, col_ind = linear_sum_assignment(cost)
-        assigned = [-1] * len(spots)
-        for r, c in zip(row_ind, col_ind):
-            if cost[r, c] < 1e5:
-                assigned[c] = track_ids[r]
-        return assigned
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -282,10 +357,12 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
     if not out.isOpened():
         raise RuntimeError("VideoWriter açılamadı (AVI/MJPG).")
 
+    # cell tracks
     cell_tracks = {}
     next_cell_id = 1
     cell_rows = []
 
+    # spot tracks
     spot_tracks = {}
     next_spot_id = 1
     spot_rows = []
@@ -300,36 +377,33 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
 
         yellow_mask = compute_yellow_mask_hsv(frame)
         spots = extract_spots(yellow_mask)
-        spots, cell_spot_count, cell_spot_area = assign_spots_to_nearest_nucleus(
-            spots, nuclei, max_dist=SPOT_ASSIGN_MAX_DIST
-        )
+        spots, cell_spot_count, cell_spot_area = assign_spots_to_nearest_nucleus(spots, nuclei, SPOT_ASSIGN_MAX_DIST)
 
-        assigned_cells = hungarian_assign_cells(cell_tracks, nuclei, MAX_DIST)
+        # --- cell tracking ---
+        dets_cells = [{"x": d["cx"], "y": d["cy"], "area": d["area"], "bbox": d["bbox"], "cc_id": d["cc_id"]} for d in nuclei]
+        assigned = hungarian_assign_tracks(cell_tracks, dets_cells, MAX_DIST, AREA_WEIGHT)
+
         for tid in list(cell_tracks.keys()):
             cell_tracks[tid]["matched"] = False
 
         new_tracks_opened = 0
-        for i, d in enumerate(nuclei):
-            tid = assigned_cells[i]
+        for i, d in enumerate(dets_cells):
+            tid = assigned[i]
             if tid == -1:
                 if d["area"] < NEW_TRACK_MIN_AREA:
                     continue
                 if new_tracks_opened >= MAX_NEW_TRACKS_PER_FRAME:
                     continue
-                if near_existing_track(cell_tracks, d, DUP_RADIUS):
+                if near_existing(cell_tracks, d["x"], d["y"], DUP_RADIUS):
                     continue
 
                 tid = next_cell_id
                 next_cell_id += 1
-                cell_tracks[tid] = {
-                    "cx": d["cx"], "cy": d["cy"], "area": d["area"],
-                    "missed": 0, "matched": True,
-                    "hits": 1, "confirmed": False
-                }
+                cell_tracks[tid] = {"x": d["x"], "y": d["y"], "area": d["area"], "missed": 0, "hits": 1, "confirmed": False, "matched": True}
                 new_tracks_opened += 1
             else:
                 tr = cell_tracks[tid]
-                tr["cx"], tr["cy"], tr["area"] = d["cx"], d["cy"], d["area"]
+                tr["x"], tr["y"], tr["area"] = d["x"], d["y"], d["area"]
                 tr["missed"] = 0
                 tr["matched"] = True
                 tr["hits"] = tr.get("hits", 0) + 1
@@ -344,16 +418,16 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
                 cell_rows.append({
                     "frame": frame_idx,
                     "track_id": tid,
-                    "x": d["cx"],
-                    "y": d["cy"],
-                    "nucleus_area": d["area"],
+                    "x": d["x"],
+                    "y": d["y"],
+                    "nucleus_area": int(d["area"]),
                     "spot_count": spot_n,
                     "spot_area_sum": spot_area_sum,
                 })
 
                 x, y, w, h = d["bbox"]
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
-                cv2.putText(frame, f"ID {tid} S{spot_n}", (x, max(0, y-5)),
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 1)
+                cv2.putText(frame, f"ID {tid} S{spot_n}", (x, max(0, y - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         for tid in list(cell_tracks.keys()):
@@ -362,28 +436,30 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
             if cell_tracks[tid]["missed"] > MAX_MISSED:
                 del cell_tracks[tid]
 
+        # --- spot tracking ---
+        dets_spots = [{"x": s["x"], "y": s["y"], "area": s["area"]} for s in spots]
+        assigned_s = hungarian_assign_tracks(spot_tracks, dets_spots, SPOT_MAX_DIST, SPOT_AREA_WEIGHT)
+
         for sid in list(spot_tracks.keys()):
             spot_tracks[sid]["matched"] = False
 
-        assigned_spots = hungarian_assign_spots(spot_tracks, spots)
-        for j, s in enumerate(spots):
-            sid = assigned_spots[j]
+        for j, s in enumerate(dets_spots):
+            sid = assigned_s[j]
             if sid == -1:
                 sid = next_spot_id
                 next_spot_id += 1
                 spot_tracks[sid] = {"x": s["x"], "y": s["y"], "area": s["area"], "missed": 0, "matched": True}
             else:
-                spot_tracks[sid]["x"] = s["x"]
-                spot_tracks[sid]["y"] = s["y"]
-                spot_tracks[sid]["area"] = s["area"]
-                spot_tracks[sid]["missed"] = 0
-                spot_tracks[sid]["matched"] = True
+                tr = spot_tracks[sid]
+                tr["x"], tr["y"], tr["area"] = s["x"], s["y"], s["area"]
+                tr["missed"] = 0
+                tr["matched"] = True
 
             spot_rows.append({
                 "frame": frame_idx,
                 "spot_id": sid,
-                "x": s["x"],
-                "y": s["y"],
+                "x": float(s["x"]),
+                "y": float(s["y"]),
                 "spot_area": int(s["area"]),
             })
 
@@ -393,12 +469,10 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
             if spot_tracks[sid]["missed"] > SPOT_MAX_MISSED:
                 del spot_tracks[sid]
 
-        if DRAW_SPOTS:
-            for s in spots:
-                cv2.circle(frame, (int(round(s["x"])), int(round(s["y"]))), 2, (0, 255, 255), 1)
+        for s in spots:
+            cv2.circle(frame, (int(round(s["x"])), int(round(s["y"]))), 2, (0, 255, 255), 1)
 
         out.write(frame)
-
         frame_idx += 1
         if progress_cb and total_frames > 0 and frame_idx % 2 == 0:
             progress_cb(min(frame_idx / total_frames, 1.0), frame_idx, total_frames)
@@ -408,7 +482,6 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
 
     cell_df = pd.DataFrame(cell_rows)
     spot_df = pd.DataFrame(spot_rows)
-
     cell_df.to_csv(output_cell_csv, index=False)
     spot_df.to_csv(output_spot_csv, index=False)
 
@@ -424,164 +497,288 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
 # =========================
 # STREAMLIT UI
 # =========================
-st.set_page_config(page_title="Hücre + Protein Spot Takibi", layout="wide")
-st.title("Hücre + Protein Spot Takibi")
+st.set_page_config(page_title="Cell/Embryo Analyzer", layout="wide")
+st.title("Cell / Embryo Analyzer")
 
-uploaded = st.file_uploader("Videoyu yükle", type=["mp4", "avi", "mov", "mkv"])
+st.warning("Lütfen yüz/kimlik gibi hassas içerik içeren dosyalar yüklemeyin. Büyük dosyalar (200MB+) sorun çıkarabilir.")
 
-default_out = str((Path.cwd() / "outputs").resolve())
-out_dir = st.text_input("Çıktı klasörü (yol)", value=default_out)
+mode = st.radio("Mod seç", ["Video", "Embryo Image (Red + Green)"])
 
-col1, col2, col3 = st.columns(3)
-auto_hsv = col1.checkbox("Sarı rengi otomatik ayarla (önerilir)", value=True)
-sample_frames = col2.slider("HSV örnek kare sayısı", 3, 20, 8)
-make_mp4 = col3.checkbox("Önizlemeyi MP4'e çevir ve sayfada oynat", value=True)
+# -------------------------------------------------------------------
+# IMAGE MODE UI
+# -------------------------------------------------------------------
+if mode == "Embryo Image (Red + Green)":
+    st.subheader("Embryo Image Modu: Kırmızıdan hücre ID → Yeşilden intensity ölç")
 
-with st.expander("Ayarlar (açıklamalı)"):
-    cA, cB = st.columns(2)
-    MIN_AREA = cA.number_input(
-        "Minimum çekirdek alanı (piksel)", value=180, step=10,
-        help="Çekirdek kaçırıyorsa düşür (140-180). Gürültü fazlaysa yükselt (200-300)."
-    )
-    THRESH_BIAS = cB.number_input(
-        "Eşik düzeltme (THRESH_BIAS)", value=0, step=1,
-        help="Az çekirdek çıkıyorsa negatif (-5). Gürültü fazlaysa pozitif (+5)."
-    )
-    SPOT_ASSIGN_MAX_DIST = cA.number_input(
-        "Spot→çekirdek max mesafe (piksel)", value=60.0, step=5.0,
-        help="Protein çekirdeğin çevresinde ise artır (60-90). Yanlış atama varsa düşür (35-60)."
-    )
-    SPOT_MAX_DIST = cB.number_input(
-        "Spot tracking max hareket (piksel)", value=15.0, step=1.0,
-        help="Spot hızlıysa artır (18-25). Karışıyorsa azalt (12-16)."
-    )
+    red_up = st.file_uploader("Red channel (ID için) - TIF/PNG", type=["tif", "tiff", "png", "jpg", "jpeg"], key="red")
+    green_up = st.file_uploader("Green channel (intensity için) - TIF/PNG", type=["tif", "tiff", "png", "jpg", "jpeg"], key="green")
 
-btn = st.button("Başlat", disabled=(uploaded is None))
+    c1, c2, c3 = st.columns(3)
+    min_area = c1.number_input("Min hücre alanı (px)", value=50, step=10,
+                               help="Çok küçük gürültüleri atar. Hücre kaçırıyorsa düşür.")
+    peak_thr = c2.slider("Ayırma hassasiyeti (peak)", 0.20, 0.60, 0.35,
+                         help="Hücreler çok birleşiyorsa biraz düşür (0.30). Fazla parçalıysa artır (0.40-0.50).")
+    put_ids = c3.checkbox("ID yazdır", value=True)
 
-if btn and uploaded is not None:
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        in_path = tmp / uploaded.name
-        in_path.write_bytes(uploaded.getbuffer())
+    run = st.button("Çalıştır", disabled=(red_up is None or green_up is None))
 
-        hsv_lower = [10, 30, 30]
-        hsv_upper = [55, 255, 255]
-        if auto_hsv:
-            hsv_lower, hsv_upper = auto_calibrate_hsv(str(in_path), sample_frames=sample_frames)
+    if run and red_up is not None and green_up is not None:
+        red_img = read_image_any(red_up)
+        green_img = read_image_any(green_up)
 
-        params = dict(
-            BLUR_SIGMA=1.2,
-            CLAHE_CLIP=2.0,
-            CLAHE_TILE=[8, 8],
-            THRESH_BIAS=int(THRESH_BIAS),
-            MIN_AREA=int(MIN_AREA),
+        # Resimler 3-kanal gelirse griye çevir (genelde tek kanal olacak)
+        if red_img.ndim == 3:
+            red_gray = cv2.cvtColor(to_uint8(red_img), cv2.COLOR_BGR2GRAY)
+        else:
+            red_gray = red_img
 
-            MAX_DIST=20,
-            AREA_WEIGHT=18.0,
-            MAX_MISSED=2,
-            NEW_TRACK_MIN_AREA=300,
-            MAX_NEW_TRACKS_PER_FRAME=6,
-            CONFIRM_HITS=4,
-            DUP_RADIUS=20,
+        if green_img.ndim == 3:
+            green_gray = cv2.cvtColor(to_uint8(green_img), cv2.COLOR_BGR2GRAY)
+        else:
+            green_gray = green_img
 
-            HSV_LOWER=hsv_lower,
-            HSV_UPPER=hsv_upper,
-            SPOT_MIN_AREA=1,
-            SPOT_MAX_AREA=200,
-            SPOT_ASSIGN_MAX_DIST=float(SPOT_ASSIGN_MAX_DIST),
+        labels = segment_cells_from_red(red_gray, min_area=int(min_area), peak_thresh=float(peak_thr))
+        df = measure_green_intensity(labels, green_gray)
 
-            SPOT_MAX_DIST=float(SPOT_MAX_DIST),
-            SPOT_AREA_WEIGHT=2.0,
-            SPOT_MAX_MISSED=2,
+        red_overlay = draw_cell_overlay(red_gray, labels, put_ids=put_ids)
+        green_overlay = draw_cell_overlay(green_gray, labels, put_ids=False)
+
+        st.success(f"Bitti ✅ Bulunan hücre sayısı: {int(labels.max())}")
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.write("Red overlay (ID + sınırlar)")
+            st.image(red_overlay, channels="BGR", use_container_width=True)
+        with colB:
+            st.write("Green overlay (sınırlar)")
+            st.image(green_overlay, channels="BGR", use_container_width=True)
+
+        st.subheader("Hücre başına Green intensity tablosu")
+        st.dataframe(df, use_container_width=True)
+
+        # files for download
+        # Save overlays as PNG bytes
+        _, red_png = cv2.imencode(".png", red_overlay)
+        _, green_png = cv2.imencode(".png", green_overlay)
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+        zip_bytes = make_zip([
+            ("cell_intensity.csv", csv_bytes),
+            ("red_overlay_ids.png", red_png.tobytes()),
+            ("green_overlay.png", green_png.tobytes()),
+        ])
+
+        st.download_button("Tüm çıktıları indir (ZIP)", data=zip_bytes,
+                           file_name="embryo_image_outputs.zip", mime="application/zip")
+        st.download_button("CSV indir (cell_intensity.csv)", data=csv_bytes,
+                           file_name="cell_intensity.csv", mime="text/csv")
+
+# -------------------------------------------------------------------
+# VIDEO MODE UI
+# -------------------------------------------------------------------
+else:
+    st.subheader("Video Modu: Hücre takibi + protein spot")
+
+    uploaded = st.file_uploader("Videoyu yükle", type=["mp4", "avi", "mov", "mkv"], key="video")
+
+    if uploaded is not None and getattr(uploaded, "size", 0) > 200 * 1024 * 1024:
+        st.error("Video çok büyük (200MB üstü). Daha küçük bir video yükleyin.")
+        st.stop()
+
+    default_out = str((Path.cwd() / "outputs").resolve())
+    out_dir = st.text_input("Çıktı klasörü (yol)", value=default_out)
+
+    col1, col2, col3 = st.columns(3)
+    auto_hsv = col1.checkbox("Sarı rengi otomatik ayarla (önerilir)", value=True)
+    sample_frames = col2.slider("HSV örnek kare sayısı", 3, 20, 8)
+    make_mp4 = col3.checkbox("Önizlemeyi MP4'e çevir ve sayfada oynat", value=True)
+
+    with st.expander("Ayarlar (açıklamalı)"):
+        cA, cB = st.columns(2)
+        MIN_AREA = cA.number_input(
+            "Minimum çekirdek alanı (piksel)", value=180, step=10,
+            help="Çekirdek kaçırıyorsa düşür (140-180). Gürültü fazlaysa yükselt (200-300)."
+        )
+        THRESH_BIAS = cB.number_input(
+            "Eşik düzeltme (THRESH_BIAS)", value=0, step=1,
+            help="Az çekirdek çıkıyorsa negatif (-5). Gürültü fazlaysa pozitif (+5)."
+        )
+        SPOT_ASSIGN_MAX_DIST = cA.number_input(
+            "Spot→çekirdek max mesafe (piksel)", value=60.0, step=5.0,
+            help="Protein çekirdeğin çevresinde ise artır (60-90). Yanlış atama varsa düşür (35-60)."
+        )
+        SPOT_MAX_DIST = cB.number_input(
+            "Spot tracking max hareket (piksel)", value=15.0, step=1.0,
+            help="Spot hızlıysa artır (18-25). Karışıyorsa azalt (12-16)."
         )
 
-        progress = st.progress(0)
-        status = st.empty()
+    btn = st.button("Başlat", disabled=(uploaded is None))
 
-        def cb(p, fi, total):
-            progress.progress(int(p * 100))
-            status.write(f"İşleniyor: {fi}/{total}")
+    if btn and uploaded is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            in_path = tmp / uploaded.name
+            in_path.write_bytes(uploaded.getbuffer())
 
-        st.info("İşleniyor...")
-        res = process_video(str(in_path), out_dir, params, progress_cb=cb)
+            hsv_lower = [10, 30, 30]
+            hsv_upper = [55, 255, 255]
+            if auto_hsv:
+                hsv_lower, hsv_upper = auto_calibrate_hsv(str(in_path), sample_frames=sample_frames)
 
-    st.success("Bitti ✅")
-    st.code(f"HSV LOWER={hsv_lower}\nHSV UPPER={hsv_upper}")
+            params = dict(
+                BLUR_SIGMA=1.2,
+                CLAHE_CLIP=2.0,
+                CLAHE_TILE=[8, 8],
+                THRESH_BIAS=int(THRESH_BIAS),
+                MIN_AREA=int(MIN_AREA),
 
-    # ---- VIDEO PREVIEW (MP4) ----
-    mp4_bytes = None
-    mp4_path = None
-    if make_mp4:
-        try:
-            avi_path = res["video_out"]
-            mp4_path = str(Path(avi_path).with_suffix(".mp4"))
-            convert_avi_to_mp4(avi_path, mp4_path)
-            mp4_bytes = Path(mp4_path).read_bytes()
-            st.subheader("Önizleme (Sayfada Oynat)")
-            st.video(mp4_bytes)
-        except Exception as e:
-            st.warning("MP4 dönüştürme başarısız oldu. AVI dosyasını indirip VLC ile açabilirsin.")
-            st.caption(str(e))
+                MAX_DIST=20,
+                AREA_WEIGHT=18.0,
+                MAX_MISSED=2,
+                NEW_TRACK_MIN_AREA=300,
+                MAX_NEW_TRACKS_PER_FRAME=6,
+                CONFIRM_HITS=4,
+                DUP_RADIUS=20,
 
-    # ---- TABLES ----
-    st.subheader("Sonuçlar (Tablo)")
+                HSV_LOWER=hsv_lower,
+                HSV_UPPER=hsv_upper,
+                SPOT_MIN_AREA=1,
+                SPOT_MAX_AREA=200,
+                SPOT_ASSIGN_MAX_DIST=float(SPOT_ASSIGN_MAX_DIST),
 
-    tab1, tab2, tab3 = st.tabs(["Hücre verisi", "Spot verisi", "Hızlı özet"])
+                SPOT_MAX_DIST=float(SPOT_MAX_DIST),
+                SPOT_AREA_WEIGHT=2.0,
+                SPOT_MAX_MISSED=2,
+            )
 
-    with tab1:
-        st.write("tracks_with_protein.csv (ilk 200 satır)")
-        st.dataframe(res["cell_df"].head(200), use_container_width=True)
+            progress = st.progress(0)
+            status = st.empty()
 
-    with tab2:
-        st.write("spot_tracks.csv (ilk 200 satır)")
-        st.dataframe(res["spot_df"].head(200), use_container_width=True)
+            def cb(p, fi, total):
+                progress.progress(int(p * 100))
+                status.write(f"İşleniyor: {fi}/{total}")
 
-    with tab3:
-        spot_df = res["spot_df"].sort_values(["spot_id", "frame"])
-        g = spot_df.groupby("spot_id", sort=False)
-        summary = g.agg(
-            first_frame=("frame", "min"),
-            last_frame=("frame", "max"),
-            n_frames=("frame", "count"),
-            area_first=("spot_area", "first"),
-            area_last=("spot_area", "last"),
-            area_max=("spot_area", "max"),
-        ).reset_index()
-        summary["area_delta"] = summary["area_last"] - summary["area_first"]
-        summary = summary.sort_values(["area_delta", "area_max"], ascending=False)
+            st.info("İşleniyor...")
+            res = process_video(str(in_path), out_dir, params, progress_cb=cb)
 
-        st.write("En çok büyüyen 20 spot")
-        st.dataframe(summary.head(20), use_container_width=True)
+        st.success("Bitti ✅")
+        st.code(f"HSV LOWER={hsv_lower}\nHSV UPPER={hsv_upper}")
 
-    # ---- DOWNLOADS ----
-    st.subheader("İndir")
+        # MP4 preview
+        mp4_bytes = None
+        if make_mp4:
+            try:
+                avi_path = res["video_out"]
+                mp4_path = str(Path(avi_path).with_suffix(".mp4"))
+                convert_avi_to_mp4(avi_path, mp4_path)
+                mp4_bytes = Path(mp4_path).read_bytes()
+                st.subheader("Önizleme (Sayfada Oynat)")
+                st.video(mp4_bytes)
+            except Exception as e:
+                st.warning("MP4 dönüştürme başarısız oldu. AVI dosyasını indirip VLC ile açabilirsin.")
+                st.caption(str(e))
 
-    video_bytes = Path(res["video_out"]).read_bytes()
-    cell_csv_bytes = Path(res["cell_csv"]).read_bytes()
-    spot_csv_bytes = Path(res["spot_csv"]).read_bytes()
+        # Tables
+        st.subheader("Sonuçlar (Tablo)")
+        tab1, tab2, tab3 = st.tabs(["Hücre verisi", "Spot verisi", "Hızlı özet"])
 
-    zip_list = [
-        ("tracked_preview.avi", video_bytes),
-        ("tracks_with_protein.csv", cell_csv_bytes),
-        ("spot_tracks.csv", spot_csv_bytes),
-    ]
-    if mp4_bytes is not None:
-        zip_list.insert(0, ("tracked_preview.mp4", mp4_bytes))
+        with tab1:
+            st.write("tracks_with_protein.csv (ilk 200 satır)")
+            st.dataframe(res["cell_df"].head(200), use_container_width=True)
 
-    zip_bytes = make_zip(zip_list)
+        with tab2:
+            st.write("spot_tracks.csv (ilk 200 satır)")
+            st.dataframe(res["spot_df"].head(200), use_container_width=True)
 
-    st.download_button("Tüm çıktıları indir (ZIP)", data=zip_bytes,
-                       file_name="cell_protein_outputs.zip", mime="application/zip")
+        with tab3:
+            spot_df = res["spot_df"].sort_values(["spot_id", "frame"])
+            g = spot_df.groupby("spot_id", sort=False)
+            summary = g.agg(
+                first_frame=("frame", "min"),
+                last_frame=("frame", "max"),
+                n_frames=("frame", "count"),
+                area_first=("spot_area", "first"),
+                area_last=("spot_area", "last"),
+                area_max=("spot_area", "max"),
+            ).reset_index()
+            summary["area_delta"] = summary["area_last"] - summary["area_first"]
+            summary = summary.sort_values(["area_delta", "area_max"], ascending=False)
+            st.write("En çok büyüyen 20 spot")
+            st.dataframe(summary.head(20), use_container_width=True)
 
-    if mp4_bytes is not None:
-        st.download_button("Önizleme videosu (MP4) indir", data=mp4_bytes,
-                           file_name="tracked_preview.mp4", mime="video/mp4")
+            # --- cell protein growth summary ---
+            st.divider()
+            st.subheader("Hangi hücrede protein daha çok büyüdü? (Hücre özeti)")
 
-    st.download_button("Önizleme videosu (AVI) indir", data=video_bytes,
-                       file_name="tracked_preview.avi", mime="video/x-msvideo")
-    st.download_button("Hücre CSV indir", data=cell_csv_bytes,
-                       file_name="tracks_with_protein.csv", mime="text/csv")
-    st.download_button("Spot CSV indir", data=spot_csv_bytes,
-                       file_name="spot_tracks.csv", mime="text/csv")
+            cell_df = res["cell_df"].sort_values(["track_id", "frame"]).copy()
 
-st.caption("Not: OpenCV pencere açamadığı için önizleme video dosya olarak üretilir.")
+            def cell_growth(gr):
+                gr = gr.sort_values("frame")
+                n = len(gr)
+                k = max(1, int(0.1 * n))  # ilk/son %10
+                early_area = float(gr["spot_area_sum"].iloc[:k].mean())
+                late_area = float(gr["spot_area_sum"].iloc[-k:].mean())
+                early_cnt = float(gr["spot_count"].iloc[:k].mean())
+                late_cnt = float(gr["spot_count"].iloc[-k:].mean())
+
+                pos = gr[gr["spot_count"] >= 1]
+                first_pos = int(pos["frame"].iloc[0]) if len(pos) else -1
+
+                return pd.Series({
+                    "first_frame": int(gr["frame"].iloc[0]),
+                    "last_frame": int(gr["frame"].iloc[-1]),
+                    "n_frames": int(n),
+                    "spot_area_early": early_area,
+                    "spot_area_late": late_area,
+                    "spot_area_delta": late_area - early_area,
+                    "spot_area_max": int(gr["spot_area_sum"].max()),
+                    "spot_count_early": early_cnt,
+                    "spot_count_late": late_cnt,
+                    "spot_count_delta": late_cnt - early_cnt,
+                    "spot_count_max": int(gr["spot_count"].max()),
+                    "first_positive_frame": first_pos,
+                })
+
+            cell_summary = cell_df.groupby("track_id").apply(cell_growth).reset_index()
+            cell_summary["protein_positive"] = cell_summary["spot_count_max"] >= 1
+            cell_summary_sorted = cell_summary.sort_values(
+                ["spot_area_delta", "spot_area_max", "spot_count_delta"],
+                ascending=False
+            )
+
+            st.caption(
+                f"Toplam hücre: {cell_summary_sorted['track_id'].nunique()} | "
+                f"Protein pozitif hücre: {int(cell_summary_sorted['protein_positive'].sum())}"
+            )
+            st.write("En çok büyüyen 20 hücre:")
+            st.dataframe(cell_summary_sorted.head(20), use_container_width=True)
+
+        # Downloads
+        st.subheader("İndir")
+        video_bytes = Path(res["video_out"]).read_bytes()
+        cell_csv_bytes = Path(res["cell_csv"]).read_bytes()
+        spot_csv_bytes = Path(res["spot_csv"]).read_bytes()
+
+        zip_list = [
+            ("tracked_preview.avi", video_bytes),
+            ("tracks_with_protein.csv", cell_csv_bytes),
+            ("spot_tracks.csv", spot_csv_bytes),
+        ]
+        if mp4_bytes is not None:
+            zip_list.insert(0, ("tracked_preview.mp4", mp4_bytes))
+
+        zip_bytes = make_zip(zip_list)
+
+        st.download_button("Tüm çıktıları indir (ZIP)", data=zip_bytes,
+                           file_name="video_outputs.zip", mime="application/zip")
+        if mp4_bytes is not None:
+            st.download_button("Önizleme MP4 indir", data=mp4_bytes,
+                               file_name="tracked_preview.mp4", mime="video/mp4")
+        st.download_button("Önizleme AVI indir", data=video_bytes,
+                           file_name="tracked_preview.avi", mime="video/x-msvideo")
+        st.download_button("Hücre CSV indir", data=cell_csv_bytes,
+                           file_name="tracks_with_protein.csv", mime="text/csv")
+        st.download_button("Spot CSV indir", data=spot_csv_bytes,
+                           file_name="spot_tracks.csv", mime="text/csv")
+
+st.caption("Not: Sunucuda OpenCV pencere açamaz; önizleme dosya/MP4 olarak gösterilir.")
