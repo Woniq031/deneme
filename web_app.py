@@ -60,13 +60,6 @@ def to_uint8(img: np.ndarray) -> np.ndarray:
 # IMAGE MODE: segment from RED, measure GREEN
 # =========================
 def segment_cells_from_red(red_gray: np.ndarray, min_area: int = 50, peak_thresh: float = 0.35) -> np.ndarray:
-    """
-    Red kanaldan hücreleri ayırmak için:
-    - Otsu threshold
-    - Distance transform + peaks
-    - Watershed
-    Dönen: labels (0 background, 1..N hücre)
-    """
     r = to_uint8(red_gray)
     blur = cv2.GaussianBlur(r, (0, 0), 1.2)
     _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -91,7 +84,6 @@ def segment_cells_from_red(red_gray: np.ndarray, min_area: int = 50, peak_thresh
     labels[labels < 2] = 0
     labels = labels - 1  # hücreler 1..N
 
-    # min_area filtresi + yeniden numaralandır
     out = np.zeros_like(labels, dtype=np.int32)
     new_id = 1
     for cid in np.unique(labels):
@@ -239,6 +231,9 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
     SPOT_AREA_WEIGHT = params["SPOT_AREA_WEIGHT"]
     SPOT_MAX_MISSED = params["SPOT_MAX_MISSED"]
 
+    # ========================================================
+    # GÜNCELLENEN GÖRÜNTÜ İŞLEME FONKSİYONLARI BURADA BAŞLIYOR
+    # ========================================================
     def segment_nuclei(frame_bgr: np.ndarray):
         B = frame_bgr[:, :, 0].astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
@@ -296,17 +291,20 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
         return dets
 
     def compute_yellow_mask_hsv(frame_bgr: np.ndarray) -> np.ndarray:
-        # Top-Hat filtresi ile arka plan parlamasını sil, küçük noktaları patlat
+        # Top-Hat filtresi (Arka planı sil, küçük/parlak noktaları vurgula)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        kernel_top = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        kernel_top = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_top)
+        
+        # DÜZELTME: Tophat sonucunu siyah-beyaz maskeye çeviriyoruz (gökyüzü yıldız hatasını çözen yer)
+        _, tophat_mask = cv2.threshold(tophat, 15, 255, cv2.THRESH_BINARY)
         
         # Orijinal HSV maskesi
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         mask_hsv = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
         
-        # İkisinin kesişimini al
-        return cv2.bitwise_and(mask_hsv, tophat)
+        # İkisinin kesişimi
+        return cv2.bitwise_and(mask_hsv, tophat_mask)
 
     def extract_spots(yellow_mask: np.ndarray):
         num, _spot_labels, stats, centroids = cv2.connectedComponentsWithStats(yellow_mask, connectivity=8)
@@ -330,15 +328,13 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
             # 1. ÖNCELİK: Maske İçinde mi? (Kesin Atama)
             for n in nuclei:
                 x, y, w, h = n["bbox"]
-                # Optimizasyon: Önce Bounding Box içinde mi diye bak
                 if x <= sx <= x + w and y <= sy <= y + h:
                     try:
-                        # Pikselin tam hücre maskesine denk gelip gelmediğini kontrol et
                         if n["mask"][sy, sx] > 0:
                             assigned_id = n["cc_id"]
                             break
                     except IndexError:
-                        pass # Sınır dışına taşmalara karşı koruma
+                        pass
             
             # 2. YEDEK (Fallback): Eğer maske dışındaysa eski mesafe formülünü kullan
             if assigned_id == 0 and len(nuclei) > 0:
@@ -358,6 +354,9 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
                 cell_spot_area[assigned_id] = cell_spot_area.get(assigned_id, 0) + int(s["area"])
 
         return spots, cell_spot_count, cell_spot_area
+    # ========================================================
+    # GÜNCELLENEN GÖRÜNTÜ İŞLEME FONKSİYONLARI BURADA BİTİYOR
+    # ========================================================
 
     def hungarian_assign_tracks(tracks: dict, dets_xy_area: list, max_dist: float, area_weight: float):
         track_ids = list(tracks.keys())
@@ -575,7 +574,6 @@ if mode == "Embryo Image (Red + Green)":
         red_img = read_image_any(red_up)
         green_img = read_image_any(green_up)
 
-        # Resimler 3-kanal gelirse griye çevir (genelde tek kanal olacak)
         if red_img.ndim == 3:
             red_gray = cv2.cvtColor(to_uint8(red_img), cv2.COLOR_BGR2GRAY)
         else:
@@ -605,8 +603,6 @@ if mode == "Embryo Image (Red + Green)":
         st.subheader("Hücre başına Green intensity tablosu")
         st.dataframe(df, use_container_width=True)
 
-        # files for download
-        # Save overlays as PNG bytes
         _, red_png = cv2.imencode(".png", red_overlay)
         _, green_png = cv2.imencode(".png", green_overlay)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
@@ -657,177 +653,3 @@ else:
             help="Protein çekirdeğin çevresinde ise artır (60-90). Yanlış atama varsa düşür (35-60)."
         )
         SPOT_MAX_DIST = cB.number_input(
-            "Spot tracking max hareket (piksel)", value=15.0, step=1.0,
-            help="Spot hızlıysa artır (18-25). Karışıyorsa azalt (12-16)."
-        )
-
-    btn = st.button("Başlat", disabled=(uploaded is None))
-
-    if btn and uploaded is not None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            in_path = tmp / uploaded.name
-            in_path.write_bytes(uploaded.getbuffer())
-
-            hsv_lower = [10, 30, 30]
-            hsv_upper = [55, 255, 255]
-            if auto_hsv:
-                hsv_lower, hsv_upper = auto_calibrate_hsv(str(in_path), sample_frames=sample_frames)
-
-            params = dict(
-                BLUR_SIGMA=1.2,
-                CLAHE_CLIP=2.0,
-                CLAHE_TILE=[8, 8],
-                THRESH_BIAS=int(THRESH_BIAS),
-                MIN_AREA=int(MIN_AREA),
-
-                MAX_DIST=20,
-                AREA_WEIGHT=18.0,
-                MAX_MISSED=2,
-                NEW_TRACK_MIN_AREA=300,
-                MAX_NEW_TRACKS_PER_FRAME=6,
-                CONFIRM_HITS=4,
-                DUP_RADIUS=20,
-
-                HSV_LOWER=hsv_lower,
-                HSV_UPPER=hsv_upper,
-                SPOT_MIN_AREA=1,
-                SPOT_MAX_AREA=200,
-                SPOT_ASSIGN_MAX_DIST=float(SPOT_ASSIGN_MAX_DIST),
-
-                SPOT_MAX_DIST=float(SPOT_MAX_DIST),
-                SPOT_AREA_WEIGHT=2.0,
-                SPOT_MAX_MISSED=2,
-            )
-
-            progress = st.progress(0)
-            status = st.empty()
-
-            def cb(p, fi, total):
-                progress.progress(int(p * 100))
-                status.write(f"İşleniyor: {fi}/{total}")
-
-            st.info("İşleniyor...")
-            res = process_video(str(in_path), out_dir, params, progress_cb=cb)
-
-        st.success("Bitti ✅")
-        st.code(f"HSV LOWER={hsv_lower}\nHSV UPPER={hsv_upper}")
-
-        # MP4 preview
-        mp4_bytes = None
-        if make_mp4:
-            try:
-                avi_path = res["video_out"]
-                mp4_path = str(Path(avi_path).with_suffix(".mp4"))
-                convert_avi_to_mp4(avi_path, mp4_path)
-                mp4_bytes = Path(mp4_path).read_bytes()
-                st.subheader("Önizleme (Sayfada Oynat)")
-                st.video(mp4_bytes)
-            except Exception as e:
-                st.warning("MP4 dönüştürme başarısız oldu. AVI dosyasını indirip VLC ile açabilirsin.")
-                st.caption(str(e))
-
-        # Tables
-        st.subheader("Sonuçlar (Tablo)")
-        tab1, tab2, tab3 = st.tabs(["Hücre verisi", "Spot verisi", "Hızlı özet"])
-
-        with tab1:
-            st.write("tracks_with_protein.csv (ilk 200 satır)")
-            st.dataframe(res["cell_df"].head(200), use_container_width=True)
-
-        with tab2:
-            st.write("spot_tracks.csv (ilk 200 satır)")
-            st.dataframe(res["spot_df"].head(200), use_container_width=True)
-
-        with tab3:
-            spot_df = res["spot_df"].sort_values(["spot_id", "frame"])
-            g = spot_df.groupby("spot_id", sort=False)
-            summary = g.agg(
-                first_frame=("frame", "min"),
-                last_frame=("frame", "max"),
-                n_frames=("frame", "count"),
-                area_first=("spot_area", "first"),
-                area_last=("spot_area", "last"),
-                area_max=("spot_area", "max"),
-            ).reset_index()
-            summary["area_delta"] = summary["area_last"] - summary["area_first"]
-            summary = summary.sort_values(["area_delta", "area_max"], ascending=False)
-            st.write("En çok büyüyen 20 spot")
-            st.dataframe(summary.head(20), use_container_width=True)
-
-            # --- cell protein growth summary ---
-            st.divider()
-            st.subheader("Hangi hücrede protein daha çok büyüdü? (Hücre özeti)")
-
-            cell_df = res["cell_df"].sort_values(["track_id", "frame"]).copy()
-
-            def cell_growth(gr):
-                gr = gr.sort_values("frame")
-                n = len(gr)
-                k = max(1, int(0.1 * n))  # ilk/son %10
-                early_area = float(gr["spot_area_sum"].iloc[:k].mean())
-                late_area = float(gr["spot_area_sum"].iloc[-k:].mean())
-                early_cnt = float(gr["spot_count"].iloc[:k].mean())
-                late_cnt = float(gr["spot_count"].iloc[-k:].mean())
-
-                pos = gr[gr["spot_count"] >= 1]
-                first_pos = int(pos["frame"].iloc[0]) if len(pos) else -1
-
-                return pd.Series({
-                    "first_frame": int(gr["frame"].iloc[0]),
-                    "last_frame": int(gr["frame"].iloc[-1]),
-                    "n_frames": int(n),
-                    "spot_area_early": early_area,
-                    "spot_area_late": late_area,
-                    "spot_area_delta": late_area - early_area,
-                    "spot_area_max": int(gr["spot_area_sum"].max()),
-                    "spot_count_early": early_cnt,
-                    "spot_count_late": late_cnt,
-                    "spot_count_delta": late_cnt - early_cnt,
-                    "spot_count_max": int(gr["spot_count"].max()),
-                    "first_positive_frame": first_pos,
-                })
-
-            cell_summary = cell_df.groupby("track_id").apply(cell_growth).reset_index()
-            cell_summary["protein_positive"] = cell_summary["spot_count_max"] >= 1
-            cell_summary_sorted = cell_summary.sort_values(
-                ["spot_area_delta", "spot_area_max", "spot_count_delta"],
-                ascending=False
-            )
-
-            st.caption(
-                f"Toplam hücre: {cell_summary_sorted['track_id'].nunique()} | "
-                f"Protein pozitif hücre: {int(cell_summary_sorted['protein_positive'].sum())}"
-            )
-            st.write("En çok büyüyen 20 hücre:")
-            st.dataframe(cell_summary_sorted.head(20), use_container_width=True)
-
-        # Downloads
-        st.subheader("İndir")
-        video_bytes = Path(res["video_out"]).read_bytes()
-        cell_csv_bytes = Path(res["cell_csv"]).read_bytes()
-        spot_csv_bytes = Path(res["spot_csv"]).read_bytes()
-
-        zip_list = [
-            ("tracked_preview.avi", video_bytes),
-            ("tracks_with_protein.csv", cell_csv_bytes),
-            ("spot_tracks.csv", spot_csv_bytes),
-        ]
-        if mp4_bytes is not None:
-            zip_list.insert(0, ("tracked_preview.mp4", mp4_bytes))
-
-        zip_bytes = make_zip(zip_list)
-
-        st.download_button("Tüm çıktıları indir (ZIP)", data=zip_bytes,
-                           file_name="video_outputs.zip", mime="application/zip")
-        if mp4_bytes is not None:
-            st.download_button("Önizleme MP4 indir", data=mp4_bytes,
-                               file_name="tracked_preview.mp4", mime="video/mp4")
-        st.download_button("Önizleme AVI indir", data=video_bytes,
-                           file_name="tracked_preview.avi", mime="video/x-msvideo")
-        st.download_button("Hücre CSV indir", data=cell_csv_bytes,
-                           file_name="tracks_with_protein.csv", mime="text/csv")
-        st.download_button("Spot CSV indir", data=spot_csv_bytes,
-                           file_name="spot_tracks.csv", mime="text/csv")
-
-st.caption("Not: Sunucuda OpenCV pencere açamaz; önizleme dosya/MP4 olarak gösterilir.")
