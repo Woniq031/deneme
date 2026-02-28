@@ -243,35 +243,70 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
         B = frame_bgr[:, :, 0].astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
         B = clahe.apply(B)
-        B = cv2.GaussianBlur(B, (0, 0), BLUR_SIGMA)
+        blurred = cv2.GaussianBlur(B, (5, 5), 0)
 
-        t, _ = cv2.threshold(B, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        t = int(np.clip(t + THRESH_BIAS, 0, 255))
-        mask = (B > t).astype(np.uint8) * 255
-
+        # Otsu
+        t, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Gürültü temizleme
         k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=2)
+        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k3, iterations=2)
 
-        num, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        # Watershed ile hücreleri ayırma
+        dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+        _, surf_fg = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, 0)
+        
+        surf_fg = np.uint8(surf_fg)
+        unknown = cv2.subtract(opening, surf_fg)
+
+        num, markers = cv2.connectedComponents(surf_fg)
+        markers = markers + 1
+        markers[unknown == 255] = 0
+
+        frame_rgb = cv2.cvtColor(B, cv2.COLOR_GRAY2BGR)
+        markers = cv2.watershed(frame_rgb, markers)
 
         dets = []
-        for cc_id in range(1, num):
-            area = int(stats[cc_id, cv2.CC_STAT_AREA])
-            if area < MIN_AREA:
+        for m_id in np.unique(markers):
+            if m_id <= 1: 
                 continue
-            cx, cy = centroids[cc_id]
-            x = int(stats[cc_id, cv2.CC_STAT_LEFT])
-            y = int(stats[cc_id, cv2.CC_STAT_TOP])
-            w = int(stats[cc_id, cv2.CC_STAT_WIDTH])
-            h = int(stats[cc_id, cv2.CC_STAT_HEIGHT])
-            dets.append({"cx": float(cx), "cy": float(cy), "area": area, "bbox": (x, y, w, h), "cc_id": int(cc_id)})
+            
+            mask = np.uint8(markers == m_id)
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts: 
+                continue
+            
+            c = max(cnts, key=cv2.contourArea)
+            area = cv2.contourArea(c)
+            if area < MIN_AREA: 
+                continue
+            
+            M = cv2.moments(c)
+            if M["m00"] == 0: 
+                continue
+            cx = float(M["m10"] / M["m00"])
+            cy = float(M["m01"] / M["m00"])
+            x, y, w, h = cv2.boundingRect(c)
+            
+            dets.append({
+                "cx": cx, "cy": cy, "area": int(area), 
+                "bbox": (x, y, w, h), "cc_id": int(m_id),
+                "mask": mask # PROTEIN ATAMASI İÇİN MASKEYİ SAKLIYORUZ
+            })
         return dets
 
     def compute_yellow_mask_hsv(frame_bgr: np.ndarray) -> np.ndarray:
+        # Top-Hat filtresi ile arka plan parlamasını sil, küçük noktaları patlat
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        kernel_top = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_top)
+        
+        # Orijinal HSV maskesi
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        return cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
+        mask_hsv = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
+        
+        # İkisinin kesişimini al
+        return cv2.bitwise_and(mask_hsv, tophat)
 
     def extract_spots(yellow_mask: np.ndarray):
         num, _spot_labels, stats, centroids = cv2.connectedComponentsWithStats(yellow_mask, connectivity=8)
@@ -285,28 +320,42 @@ def process_video(video_path: str, out_dir: str, params: dict, progress_cb=None)
         return spots
 
     def assign_spots_to_nearest_nucleus(spots: list, nuclei: list, max_dist: float):
-        if len(nuclei) == 0:
-            for s in spots:
-                s["cell_cc_id"] = 0
-            return spots, {}, {}
-
-        nuc_xy = np.array([(d["cx"], d["cy"], d["cc_id"]) for d in nuclei], dtype=np.float32)
         cell_spot_count = {}
         cell_spot_area = {}
 
         for s in spots:
-            sx, sy = s["x"], s["y"]
-            dx = nuc_xy[:, 0] - sx
-            dy = nuc_xy[:, 1] - sy
-            dist2 = dx * dx + dy * dy
-            k = int(np.argmin(dist2))
-            dist = float(np.sqrt(dist2[k]))
-            cc_id = int(nuc_xy[k, 2]) if dist <= max_dist else 0
-            s["cell_cc_id"] = cc_id
+            sx, sy = int(s["x"]), int(s["y"])
+            assigned_id = 0
+            
+            # 1. ÖNCELİK: Maske İçinde mi? (Kesin Atama)
+            for n in nuclei:
+                x, y, w, h = n["bbox"]
+                # Optimizasyon: Önce Bounding Box içinde mi diye bak
+                if x <= sx <= x + w and y <= sy <= y + h:
+                    try:
+                        # Pikselin tam hücre maskesine denk gelip gelmediğini kontrol et
+                        if n["mask"][sy, sx] > 0:
+                            assigned_id = n["cc_id"]
+                            break
+                    except IndexError:
+                        pass # Sınır dışına taşmalara karşı koruma
+            
+            # 2. YEDEK (Fallback): Eğer maske dışındaysa eski mesafe formülünü kullan
+            if assigned_id == 0 and len(nuclei) > 0:
+                nuc_xy = np.array([(d["cx"], d["cy"], d["cc_id"]) for d in nuclei])
+                dx = nuc_xy[:, 0] - sx
+                dy = nuc_xy[:, 1] - sy
+                dist2 = dx * dx + dy * dy
+                k = int(np.argmin(dist2))
+                dist = float(np.sqrt(dist2[k]))
+                if dist <= max_dist:
+                    assigned_id = int(nuc_xy[k, 2])
 
-            if cc_id != 0:
-                cell_spot_count[cc_id] = cell_spot_count.get(cc_id, 0) + 1
-                cell_spot_area[cc_id] = cell_spot_area.get(cc_id, 0) + int(s["area"])
+            s["cell_cc_id"] = assigned_id
+
+            if assigned_id != 0:
+                cell_spot_count[assigned_id] = cell_spot_count.get(assigned_id, 0) + 1
+                cell_spot_area[assigned_id] = cell_spot_area.get(assigned_id, 0) + int(s["area"])
 
         return spots, cell_spot_count, cell_spot_area
 
